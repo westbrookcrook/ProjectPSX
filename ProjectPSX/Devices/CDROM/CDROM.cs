@@ -1,8 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using ProjectPSX.Devices.CdRom;
+using static ProjectPSX.Devices.CdRom.TrackBuilder;
 
 namespace ProjectPSX.Devices {
-    //TODO This is class is pretty much broken and the culprit ofc that many games dosnt work.
+    //TODO This is class is pretty much broken and the culprit ofc that many games doesn't work.
     //Need to rework timmings. An edge trigger should be implemented for interrupts
     public class CDROM {
 
@@ -40,82 +43,186 @@ namespace ProjectPSX.Devices {
         //1   AutoPause(0 = Off, 1 = Auto Pause upon End of Track); for Audio Play
         //0   CDDA(0 = Off, 1 = Allow to Read CD - DA Sectors; ignore missing EDC)
         private bool isDoubleSpeed;
-        private bool XA_ADPCM;
+        private bool isXAADPCM;
         private bool isSectorSizeRAW;
         private bool isIgnoreBit;
-        private bool XA_Filter;
+        private bool isXAFilter;
         private bool isReport;
         private bool isAutoPause;
         private bool isCDDA;
+
+        private byte filterFile;
+        private byte filterChannel;
+
+        private bool mutedAudio;
+        private bool mutedXAADPCM;
+
+        private byte pendingVolumeLtoL = 0xFF;
+        private byte pendingVolumeLtoR = 0;
+        private byte pendingVolumeRtoL = 0;
+        private byte pendingVolumeRtoR = 0xFF;
+
+        private byte volumeLtoL = 0xFF;
+        private byte volumeLtoR = 0;
+        private byte volumeRtoL = 0;
+        private byte volumeRtoR = 0xFF;
+
+        private bool cdDebug = false;
+
+        private struct SectorHeader {
+            public byte mm;
+            public byte ss;
+            public byte ff;
+            public byte mode;
+        }
+        private SectorHeader sectorHeader;
+
+        private struct SectorSubHeader {
+            public byte file;
+            public byte channel;
+            public byte subMode;
+            public byte codingInfo;
+
+            public bool isEndOfRecord => (subMode & 0x1) != 0;
+            public bool isVideo => (subMode & 0x2) != 0;
+            public bool isAudio => (subMode & 0x4) != 0;
+            public bool isData => (subMode & 0x8) != 0;
+            public bool isTrigger => (subMode & 0x10) != 0;
+            public bool isForm2 => (subMode & 0x20) != 0;
+            public bool isRealTime => (subMode & 0x40) != 0;
+            public bool isEndOfFile => (subMode & 0x80) != 0;
+        }
+        private SectorSubHeader sectorSubHeader;
 
         private enum Mode {
             Idle,
             Seek,
             Read,
+            Play,
             TOC
         }
-        Mode mode = Mode.Idle;
+        private Mode mode = Mode.Idle;
 
         private int counter;
         private Queue<byte> interruptQueue = new Queue<byte>();
 
         private CD cd;
+        private SPU spu;
 
-        public CDROM() {
-            cd = new CD();
+        public CDROM(CD cd, SPU spu) {
+            this.cd = cd;
+            this.spu = spu;
         }
 
-        bool edgeTrigger;
+        private bool edgeTrigger;
+
         public bool tick(int cycles) {
             counter += cycles;
 
-            if (/*counter > 6000 && */interruptQueue.Count != 0 && IF == 0) {
-                //Console.WriteLine($"[CDROM] Interrupt Queue is size: {interruptQueue.Count} dequeue to IF next Interrupt: {interruptQueue.Peek()}");
+            if (interruptQueue.Count != 0 && IF == 0) {
+                if (cdDebug) Console.WriteLine($"[CDROM] Interrupt Queue is size: {interruptQueue.Count} dequeue to IF next Interrupt: {interruptQueue.Peek()}");
                 IF |= interruptQueue.Dequeue();
                 //edgeTrigger = true;
             }
 
-            if (/*edgeTrigger && */(IF & IE) != 0) {
-                //Console.WriteLine($"[CD INT] Triggering {IF:x8}");
-                //edgeTrigger = false;
+            if (/*edgeTrigger &&*/ (IF & IE) != 0) {
+                if (cdDebug) Console.WriteLine($"[CD INT] Triggering {IF:x8}");
+                edgeTrigger = false;
+                isBusy = false;
                 return true;
             }
 
             switch (mode) {
                 case Mode.Idle:
-                    if (interruptQueue.Count != 0) { //Await some cycles so interrupts are not triggered instant
+                        counter = 0;
                         return false;
-                    }
-                    counter = 0;
-                    //Console.WriteLine("[CDROM] MODE IDLE");
-                    break;
 
-                case Mode.Seek:
-                    if (counter < 100000 || interruptQueue.Count != 0) {
+                case Mode.Seek: //Hardcoded seek time...
+                    if (counter < 33868800 / 3 || interruptQueue.Count != 0) {
                         return false;
                     }
                     counter = 0;
-                    //Console.WriteLine("[CDROM] MODE SEEK");
+                    mode = Mode.Idle;
+                    STAT = (byte)(STAT & (~0x40));
+
+                    responseBuffer.Enqueue(STAT);
+                    interruptQueue.Enqueue(0x2);
                     break;
 
                 case Mode.Read:
-                    if (counter < (33868800 / (isDoubleSpeed ? 150 : 75)) /*&& dataBuffer.Count > 0*/) {
+                case Mode.Play:
+                    if (counter < (33868800 / (isDoubleSpeed ? 150 : 75)) || interruptQueue.Count != 0) {
                         return false;
                     }
-                    //if (dataBuffer.Count == 0) {
-                    //Console.ForegroundColor = ConsoleColor.DarkGreen;
-                    //Console.WriteLine($"Reading readLoc: {readLoc} seekLoc: {seekLoc}");
-                    //Console.ResetColor();
-                    cdBuffer = new Queue<byte>(cd.Read(isSectorSizeRAW, readLoc++));
-
-                    if(interruptQueue.Count != 0) {
-                        return false;
-                    }
-                    responseBuffer.Enqueue(STAT);
-                    interruptQueue.Enqueue(0x1);
                     counter = 0;
 
-                    //Console.WriteLine("[CDROM] MODE READ");
+                    byte[] rawSector = cd.Read(readLoc++);
+
+                    if (cdDebug) {
+                        Console.ForegroundColor = ConsoleColor.DarkGreen;
+                        Console.WriteLine($"Reading readLoc: {readLoc - 1} seekLoc: {seekLoc} size: {rawSector.Length}");
+                        Console.ResetColor();
+                    }
+
+                    if (mode == Mode.Play && !mutedAudio) {
+                        applyVolume(rawSector);
+                        spu.pushCdBufferSamples(rawSector);
+                        return false; //CDDA isn't delivered to CPU and doesn't raise interrupt
+                    }
+
+                    //first 12 are the sync header
+                    sectorHeader.mm = rawSector[12];
+                    sectorHeader.ss = rawSector[13];
+                    sectorHeader.ff = rawSector[14];
+                    sectorHeader.mode = rawSector[15];
+
+                    sectorSubHeader.file = rawSector[16];
+                    sectorSubHeader.channel = rawSector[17];
+                    sectorSubHeader.subMode = rawSector[18];
+                    sectorSubHeader.codingInfo = rawSector[19];
+
+                    //if (sectorSubHeader.isVideo) Console.WriteLine("is video");
+                    //if (sectorSubHeader.isData) Console.WriteLine("is data");
+                    //if (sectorSubHeader.isAudio) Console.WriteLine("is audio");
+
+                    if (isXAADPCM && sectorSubHeader.isForm2) {
+                        if (sectorSubHeader.isEndOfFile) {
+                            if (cdDebug) Console.WriteLine("[CDROM] XA ON: End of File!");
+                            //is this even needed? There seems to not be an AutoPause flag like on CDDA
+                            //RR4, Castlevania and others hang sound here if hard stoped to STAT 0x2
+                        }
+
+                        if (sectorSubHeader.isRealTime && sectorSubHeader.isAudio) {
+
+                            if (isXAFilter && (filterFile != sectorSubHeader.file || filterChannel != sectorSubHeader.channel)) {
+                                if (cdDebug) Console.WriteLine("[CDROM] XA Filter: file || channel");
+                                return false;
+                            }
+
+                            if (cdDebug) Console.WriteLine("[CDROM] XA ON: Realtime + Audio"); //todo flag to pass to SPU?
+
+                            if(!mutedAudio && !mutedXAADPCM) {
+                                byte[] decodedXaAdpcm = XaAdpcm.Decode(rawSector, sectorSubHeader.codingInfo);
+                                applyVolume(decodedXaAdpcm);
+                                spu.pushCdBufferSamples(decodedXaAdpcm);
+                            }
+
+                            return false;
+                        }
+                    }
+
+                    //If we arived here sector is supposed to be delivered to CPU so slice out sync and header based on flag
+                    if (!isSectorSizeRAW) {
+                        rawSector = rawSector.AsSpan().Slice(24, 0x800).ToArray();
+                    } else {
+                        rawSector = rawSector.AsSpan().Slice(12).ToArray();
+                    }
+
+                    cdBuffer = new Queue<byte>(rawSector);
+
+                    responseBuffer.Enqueue(STAT);
+                    interruptQueue.Enqueue(0x1);
+
                     break;
 
                 case Mode.TOC:
@@ -135,11 +242,11 @@ namespace ProjectPSX.Devices {
         public uint load(Width w, uint addr) {
             switch (addr) {
                 case 0x1F801800:
-                    //Console.WriteLine($"[CDROM] [L00] STATUS: {STATUS():x2}");
+                    if (cdDebug) Console.WriteLine($"[CDROM] [L00] STATUS: {STATUS():x2}");
                     return STATUS();
 
                 case 0x1F801801:
-                    //Console.WriteLine("[CDROM] [L01] RESPONSE " + responseBuffer.Peek().ToString("x8"));
+                    if (cdDebug) Console.WriteLine("[CDROM] [L01] RESPONSE " /*+ responseBuffer.Peek().ToString("x8")*/);
                     //Console.ReadLine();
                     //if (w == Width.HALF || w == Width.WORD) Console.WriteLine("WARNING RESPONSE BUFFER LOAD " + w);
 
@@ -149,7 +256,7 @@ namespace ProjectPSX.Devices {
                     return 0xFF;
 
                 case 0x1F801802:
-                    //Console.WriteLine("[CDROM] [L02] DATA");
+                    if (cdDebug) Console.WriteLine("[CDROM] [L02] DATA");
                     //Console.WriteLine(dataBuffer.Count);
                     //Console.ReadLine();
                     if (w == Width.BYTE) {
@@ -164,14 +271,14 @@ namespace ProjectPSX.Devices {
                     switch (INDEX) {
                         case 0:
                         case 2:
-                            //Console.WriteLine("[CDROM] [L03.0] IE: {0}", ((uint)(0xe0 | IE)).ToString("x8"));
+                            if (cdDebug) Console.WriteLine("[CDROM] [L03.0] IE: {0}", ((uint)(0xe0 | IE)).ToString("x8"));
                             return (uint)(0xe0 | IE);
                         case 1:
                         case 3:
-                            //Console.WriteLine("[CDROM] [L03.1] IF: {0}", ((uint)(0xe0 | IF)).ToString("x8"));
+                            if (cdDebug) Console.WriteLine("[CDROM] [L03.1] IF: {0}", ((uint)(0xe0 | IF)).ToString("x8"));
                             return (uint)(0xe0 | IF);
                         default:
-                            //Console.WriteLine("[CDROM] [L03.x] Unimplemented");
+                            if (cdDebug) Console.WriteLine("[CDROM] [L03.x] Unimplemented");
                             return 0;
                     }
 
@@ -182,31 +289,47 @@ namespace ProjectPSX.Devices {
         public void write(Width w, uint addr, uint value) {
             switch (addr) {
                 case 0x1F801800:
-                    //Console.WriteLine($"[CDROM] [W00] I: {value:x8}");
+                    if (cdDebug) Console.WriteLine($"[CDROM] [W00] I: {value:x8}");
                     INDEX = (byte)(value & 0x3);
                     break;
                 case 0x1F801801:
                     if (INDEX == 0) {
-                        //Console.BackgroundColor = ConsoleColor.Yellow;
-                        //Console.WriteLine($"[CDROM] [W01.0] [COMMAND] >>> {value:x2}");
-                        //Console.ResetColor();
+                        if (cdDebug) {
+                            Console.BackgroundColor = ConsoleColor.Yellow;
+                            Console.WriteLine($"[CDROM] [W01.0] [COMMAND] >>> {value:x2}");
+                            Console.ResetColor();
+                        }
                         ExecuteCommand(value);
+                    } else if (INDEX == 3) {
+                        if (cdDebug) Console.WriteLine($"[CDROM] [W01.3] pendingVolumeRtoR: {value:x8}");
+                        pendingVolumeRtoR = (byte)value;
                     } else {
-                        //Console.WriteLine($"[CDROM] [Unhandled Write] Index: {INDEX:x8} Access: {addr:x8} Value: {value:x8}");
+                        if (cdDebug) Console.WriteLine($"[CDROM] [Unhandled Write] Index: {INDEX:x8} Access: {addr:x8} Value: {value:x8}");
                     }
                     break;
                 case 0x1F801802:
                     switch (INDEX) {
                         case 0:
-                            //Console.WriteLine($"[CDROM] [W02.0] Parameter: {value:x8}");
+                            if (cdDebug) Console.WriteLine($"[CDROM] [W02.0] Parameter: {value:x8}");
                             parameterBuffer.Enqueue(value);
                             break;
                         case 1:
-                            //Console.WriteLine($"[CDROM] [W02.1] Set IE: {value:x8}");
+                            if (cdDebug) Console.WriteLine($"[CDROM] [W02.1] Set IE: {value:x8}");
                             IE = (byte)(value & 0x1F);
                             break;
+
+                        case 2:
+                            if (cdDebug) Console.WriteLine($"[CDROM] [W02.2] pendingVolumeLtoL: {value:x8}");
+                            pendingVolumeLtoL = (byte)value;
+                            break;
+
+                        case 3:
+                            if (cdDebug) Console.WriteLine($"[CDROM] [W02.3] pendingVolumeRtoL: {value:x8}");
+                            pendingVolumeRtoL = (byte)value;
+                            break;
+
                         default:
-                            //Console.WriteLine($"[CDROM] [Unhandled Write] Access: {addr:x8} Value: {value:x8}");
+                            if (cdDebug) Console.WriteLine($"[CDROM] [Unhandled Write] Access: {addr:x8} Value: {value:x8}");
                             break;
                     }
                     break;
@@ -223,36 +346,60 @@ namespace ProjectPSX.Devices {
                                 if (dataBuffer.Count > 0) { /*Console.WriteLine(">>>>>>> CDROM BUFFER WAS NOT EMPTY <<<<<<<<<");*/ return; }
                                 dataBuffer = cdBuffer;
                             } else {
-                                //Console.ForegroundColor = ConsoleColor.Red;
-                                //Console.WriteLine("[CDROM] [W03.0] Data Clear");
-                                //Console.ResetColor();
+                                if (cdDebug) {
+                                    Console.ForegroundColor = ConsoleColor.Red;
+                                    Console.WriteLine("[CDROM] [W03.0] Data Clear");
+                                    Console.ResetColor();
+                                }
                                 dataBuffer.Clear();
                             }
                             break;
                         case 1:
                             IF &= (byte)~(value & 0x1F);
-                            //Console.WriteLine($"[CDROM] [W03.1] Set IF: {value:x8} -> IF = {IF:x8}");
-                            if (value == 0x40) {
-                                //Console.WriteLine($"[CDROM] [W03.1 Parameter Buffer Clear] value {value:x8}");
+                            if (cdDebug) Console.WriteLine($"[CDROM] [W03.1] Set IF: {value:x8} -> IF = {IF:x8}");
+                            if (interruptQueue.Count > 0) {
+                                IF |= interruptQueue.Dequeue();
+                            }
+
+                            if ((value & 0x40) == 0x40) {
+                                if (cdDebug) Console.WriteLine($"[CDROM] [W03.1 Parameter Buffer Clear] value {value:x8}");
                                 parameterBuffer.Clear();
                             }
                             break;
 
+                        case 2:
+                            if (cdDebug) Console.WriteLine($"[CDROM] [W03.2] pendingVolumeLtoR: {value:x8}");
+                            pendingVolumeLtoR = (byte)value;
+                            break;
+
+                        case 3:
+                            if (cdDebug) Console.WriteLine($"[CDROM] [W03.3] ApplyVolumes: {value:x8}");
+                            mutedXAADPCM = (value & 0x1) != 0;
+                            bool applyVolume = (value & 0x20) != 0;
+                            if (applyVolume) {
+                                volumeLtoL = pendingVolumeLtoL;
+                                volumeLtoR =  pendingVolumeLtoR;
+                                volumeRtoL =  pendingVolumeRtoL;
+                                volumeRtoR = pendingVolumeRtoR;
+                            }
+                            break;
+
                         default:
-                            //Console.WriteLine($"[CDROM] [Unhandled Write] Access: {addr:x8} Value: {value:x8}");
+                            if (cdDebug) Console.WriteLine($"[CDROM] [Unhandled Write] Access: {addr:x8} Value: {value:x8}");
                             break;
                     }
                     break;
                 default:
-                    //Console.WriteLine($"[CDROM] [Unhandled Write] Access: {addr:x8} Value: {value:x8}");
+                    if (cdDebug) Console.WriteLine($"[CDROM] [Unhandled Write] Access: {addr:x8} Value: {value:x8}");
                     break;
             }
         }
 
         private void ExecuteCommand(uint value) {
-            //Console.WriteLine("[CDROM] Command " + value.ToString("x4"));
-            //interruptQueue.Clear(); //this fixes the badhankakus on bios, but it confirms our cdrom timming problems...
-            //responseBuffer.Clear();
+            if (cdDebug) Console.WriteLine($"[CDROM] Command {value:x4}");
+            interruptQueue.Clear();
+            responseBuffer.Clear();
+            isBusy = true;
             switch (value) {
                 case 0x01: getStat(); break;
                 case 0x02: setLoc(); break;
@@ -284,6 +431,8 @@ namespace ProjectPSX.Devices {
         }
 
         private void mute() {
+            mutedAudio = true;
+
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x3);
         }
@@ -304,23 +453,36 @@ namespace ProjectPSX.Devices {
             interruptQueue.Enqueue(0x2);
         }
 
-        private void getLocL() { //HARDCODED,THIS NEEDS CUE PARSER
-            //Console.ForegroundColor = ConsoleColor.Red;
-            //Console.WriteLine("[CDROM] getLocL WARNING BROKEN COMMAND");
-            //Console.ReadLine();
-            //Console.ResetColor();
+        private void getLocL() {
+            if (cdDebug) {
+                Console.WriteLine($"mm: {sectorHeader.mm} ss: {sectorHeader.ss} ff: {sectorHeader.ff} mode: {sectorHeader.mode}" +
+                    $" file: {sectorSubHeader.file} channel: {sectorSubHeader.channel} subMode: {sectorSubHeader.subMode} codingInfo: {sectorSubHeader.codingInfo}");
+            }
 
-            responseBuffer.EnqueueRange<uint>(0, 0, 0, 0, 0, 0, 0, 0);
+            responseBuffer.EnqueueRange(
+                sectorHeader.mm, sectorHeader.ss, sectorHeader.ff, sectorHeader.mode, sectorSubHeader.file,
+                sectorSubHeader.channel, sectorSubHeader.subMode, sectorSubHeader.codingInfo);
+
             interruptQueue.Enqueue(0x3);
         }
 
-        private void getLocP() { //HARDCODED, THIS NEEDS CUE PARSER
-            //Console.ForegroundColor = ConsoleColor.Red;
-            //Console.WriteLine("[CDROM] getLocP WARNING BROKEN COMMAND");
-            //Console.ReadLine();
-            //Console.ResetColor();
+        private void getLocP() { //SubQ missing...
 
-            responseBuffer.EnqueueRange<uint>(0, 0, 0, 0, 0, 0, 0, 0);
+            Track track = cd.getTrackFromLoc(readLoc);
+            (byte mm, byte ss, byte ff) = getMMSSFFfromLBA(readLoc - track.lbaStart);
+            (byte amm, byte ass, byte aff) = getMMSSFFfromLBA(readLoc);
+
+            if (cdDebug) {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"track: {track.number} index: {1} mm: {mm} ss: {ss}" +
+                    $" ff: {ff} amm: {amm} ass: {ass} aff: {aff}");
+                Console.WriteLine($"track: {track.number} index: {1} mm: {DecToBcd(mm)} ss: {DecToBcd(ss)}" +
+                    $" ff: {DecToBcd(ff)} amm: {DecToBcd(amm)} ass: {DecToBcd(ass)} aff: {DecToBcd(aff)}");
+                Console.ResetColor();
+            }
+
+            responseBuffer.EnqueueRange<uint>((uint)track.number, 1, DecToBcd(mm), DecToBcd(ss), DecToBcd(ff), DecToBcd(amm), DecToBcd(ass), DecToBcd(aff));
+
             interruptQueue.Enqueue(0x3);
         }
 
@@ -346,8 +508,9 @@ namespace ProjectPSX.Devices {
             interruptQueue.Enqueue(0x2);
         }
 
-        private void setFilter() { // broken re asks for it
-            parameterBuffer.Clear();
+        private void setFilter() {
+            filterFile = (byte)parameterBuffer.Dequeue();
+            filterChannel = (byte)parameterBuffer.Dequeue();
 
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x3);
@@ -363,7 +526,6 @@ namespace ProjectPSX.Devices {
             interruptQueue.Enqueue(0x3);
 
             mode = Mode.Read;
-            //isBusy = true;
         }
 
         private void seekP() {
@@ -374,26 +536,27 @@ namespace ProjectPSX.Devices {
 
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x3);
-
-            STAT = 0x2;
-
-            responseBuffer.Enqueue(STAT);
-            interruptQueue.Enqueue(0x2);
         }
 
 
-        private void play() { //broken hardcoded to push puzzle bubble 2 to play
+        private void play() {
+            //If theres a trackN param it seeks and plays from the start location of it
+            int track = 0;
+            if (parameterBuffer.Count > 0) {
+                track = BcdToDec((byte)parameterBuffer.Dequeue());
+                readLoc = seekLoc = cd.tracks[track].lbaStart;
+                //else it plays from the previously seekLoc and seeks if not done (actually not checking if already seeked)
+            } else {
+                readLoc = seekLoc;
+            }
+
+            Console.WriteLine($"[CDROM] CDDA Play Triggered Track: {track} readLoc: {readLoc}");
+
             STAT = 0x82;
-            mode = Mode.Read;
-            //int track = BcdToDec((byte)parameterBuffer.Dequeue());
-            // Console.WriteLine("Track " + track);
+            mode = Mode.Play;
 
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x3);
-
-
-            //responseBuffer.Enqueue(STAT);
-            //interruptQueue.Enqueue(0x1);
         }
 
         private void stop() {
@@ -404,19 +567,23 @@ namespace ProjectPSX.Devices {
 
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x2);
+
+            mode = Mode.Idle;
         }
 
         private void getTD() {
             int track = BcdToDec((byte)parameterBuffer.Dequeue());
 
-            if (track == 0) {
+            if (track == 0) { //returns CD LBA / End of last track
                 (byte mm, byte ss, byte ff) = getMMSSFFfromLBA(cd.getLBA());
                 responseBuffer.EnqueueRange<uint>(STAT, DecToBcd(mm), DecToBcd(ss));
+                //if (cdDebug)
                 Console.WriteLine($"[CDROM] getTD Track: {track} STAT: {STAT:x2} {mm}:{ss}");
-            } else {
-                //assuming only 1 track BIN. Anything beyond would require a CUE parser
-                responseBuffer.EnqueueRange<uint>(STAT, 0, 2);
-                Console.WriteLine($"[CDROM] getTD Track: {track} STAT: {STAT:x2} HardCoded Track 1 00:02");
+            } else { //returns Track Start
+                (byte mm, byte ss, byte ff) = getMMSSFFfromLBA(cd.tracks[track - 1].lbaStart);
+                responseBuffer.EnqueueRange<uint>(STAT, DecToBcd(mm), DecToBcd(ss));
+                //if (cdDebug)
+                Console.WriteLine($"[CDROM] getTD Track: {track} STAT: {STAT:x2} {mm}:{ss}");
             }
 
             //Console.ReadLine();
@@ -424,15 +591,16 @@ namespace ProjectPSX.Devices {
         }
 
         private void getTN() {
-            //todo: Hardcoded tracks: 1. Anything beyond would require a CUE parser
-            Console.WriteLine("[CDROM] getTN HardCoded Tracks: 1 1");
+            //if (cdDebug)
+            Console.WriteLine($"[CDROM] getTN First Track: 1 (Hardcoded) - Last Track: {cd.tracks.Count}");
             //Console.ReadLine();
-            responseBuffer.EnqueueRange<uint>(STAT, 1, 1);
+            responseBuffer.EnqueueRange<uint>(STAT, 1, DecToBcd((byte)cd.tracks.Count));
             interruptQueue.Enqueue(0x3);
         }
 
         private void demute() {
-            //this demutes the spu but we dont have one...
+            mutedAudio = false;
+
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x3);
         }
@@ -448,12 +616,11 @@ namespace ProjectPSX.Devices {
         }
 
         private void pause() {
-            //todo actual pause transfers
-            STAT = 0x2;
-            mode = Mode.Idle;
-
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x3);
+
+            STAT = 0x2;
+            mode = Mode.Idle;
 
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x2);
@@ -469,7 +636,6 @@ namespace ProjectPSX.Devices {
             interruptQueue.Enqueue(0x3);
 
             mode = Mode.Read;
-            //isBusy = true;
         }
 
         private void setMode() {
@@ -486,10 +652,10 @@ namespace ProjectPSX.Devices {
             //Console.WriteLine($"[CDROM] SetMode: {mode:x8}");
 
             isDoubleSpeed = ((mode >> 7) & 0x1) == 1;
-            XA_ADPCM = ((mode >> 6) & 0x1) == 1;
+            isXAADPCM = ((mode >> 6) & 0x1) == 1;
             isSectorSizeRAW = ((mode >> 5) & 0x1) == 1;
             isIgnoreBit = ((mode >> 4) & 0x1) == 1;
-            XA_Filter = ((mode >> 3) & 0x1) == 1;
+            isXAFilter = ((mode >> 3) & 0x1) == 1;
             isReport = ((mode >> 2) & 0x1) == 1;
             isAutoPause = ((mode >> 1) & 0x1) == 1;
             isCDDA = (mode & 0x1) == 1;
@@ -516,11 +682,6 @@ namespace ProjectPSX.Devices {
 
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x3);
-
-            STAT = 0x2;
-
-            responseBuffer.Enqueue(STAT);
-            interruptQueue.Enqueue(0x2);
         }
 
         private void setLoc() {
@@ -535,26 +696,22 @@ namespace ProjectPSX.Devices {
             int second = BcdToDec(ss);
             int sector = BcdToDec(ff);
 
-            //temporal bin hack to bypass cue parse - 2 secs
-            //WARNING this can wreck some games that setLoc to s0 or s1
-            second -= 2;
-
             //There are 75 sectors on a second
             seekLoc = sector + (second * 75) + (minute * 60 * 75);
+
             if (seekLoc < 0) {
                 Console.WriteLine($"[CDROM] WARNING NEGATIVE setLOC {seekLoc:x8}");
                 seekLoc = 0;
             }
-            //Console.ForegroundColor = ConsoleColor.DarkGreen;
-            //Console.WriteLine($"[CDROM] setLoc {minute:x2}:{second:x2}:{sector:x2} Loc: {seekLoc:x8}");
-            //Console.ReadLine();
-            //Console.ResetColor();
+
+            if (cdDebug) {
+                Console.ForegroundColor = ConsoleColor.DarkGreen;
+                Console.WriteLine($"[CDROM] setLoc {mm:x2}:{ss:x2}:{ff:x2} Loc: {seekLoc:x8}");
+                Console.ResetColor();
+            }
 
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x3);
-
-            responseBuffer.Enqueue(STAT);
-            interruptQueue.Enqueue(0x2);
         }
 
         private void getID() {
@@ -562,13 +719,13 @@ namespace ProjectPSX.Devices {
             //STAT = 0x2; //0x40 seek
             //responseBuffer.Enqueue(STAT);
             //interruptQueue.Enqueue(0x3);
-
-            //responseBuffer.AddRange<uint>(0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+            //
+            //responseBuffer.EnqueueRange<uint>(0x08, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
             //interruptQueue.Enqueue(0x5);
 
             //Door Open              INT5(11h,80h)  N/A
             //STAT = 0x10; //Shell Open
-            //responseBuffer.AddRange<uint>(0x11, 0x80, 0x00, 0x00);
+            //responseBuffer.EnqueueRange<uint>(0x11, 0x80, 0x00, 0x00);
             //interruptQueue.Enqueue(0x5);
 
             //Licensed: Mode2 INT3(stat)     INT2(02h, 00h, 20h, 00h, 53h, 43h, 45h, 4xh)
@@ -577,8 +734,7 @@ namespace ProjectPSX.Devices {
             responseBuffer.Enqueue(STAT);
             interruptQueue.Enqueue(0x3);
 
-            responseBuffer.EnqueueRange<uint>(0x02, 0x00, 0x20, 0x00, 0x53, 0x43, 0x45, 0x41); //SCE | //A 0x41 (America) - I 0x49 (Japan) - E 0x45 (Europe) 
-
+            responseBuffer.EnqueueRange<uint>(0x02, 0x00, 0x20, 0x00, 0x53, 0x43, 0x45, 0x41); //SCE | //A 0x41 (America) - I 0x49 (Japan) - E 0x45 (Europe)
             interruptQueue.Enqueue(0x2);
         }
 
@@ -641,7 +797,7 @@ namespace ProjectPSX.Devices {
             stat |= responseBuffer_hasData() << 5;
             stat |= parametterBuffer_hasSpace() << 4;
             stat |= parametterBuffer_isEmpty() << 3;
-            //stat |= XA-ADPCM() << 2;
+            stat |= isXAADPCM ? (1 << 2) : 0;
             stat |= INDEX;
             return (byte)stat;
         }
@@ -662,11 +818,11 @@ namespace ProjectPSX.Devices {
             return (responseBuffer.Count > 0) ? 1 : 0;
         }
 
-        byte DecToBcd(byte value) {
+        private static byte DecToBcd(byte value) {
             return (byte)(value + 6 * (value / 10));
         }
 
-        int BcdToDec(byte value) {
+        private static int BcdToDec(byte value) {
             return value - 6 * (value >> 4);
         }
 
@@ -682,6 +838,22 @@ namespace ProjectPSX.Devices {
             return ((byte)mm, (byte)ss, (byte)ff);
         }
 
+        private void applyVolume(byte[] rawSector) {
+            if (mutedAudio) return;
+
+            var samples = MemoryMarshal.Cast<byte, short>(rawSector);
+
+            for(int i = 0; i < samples.Length; i+=2) {
+                short l = samples[i];
+                short r = samples[i + 1];
+
+                int volumeL = ((l * volumeLtoL) >> 7) + ((r * volumeRtoL) >> 7);
+                int volumeR = ((l * volumeLtoR) >> 7) + ((r * volumeRtoR) >> 7);
+
+                samples[i] =     (short)Math.Clamp(volumeL, -0x8000, 0x7FFF);
+                samples[i + 1] = (short)Math.Clamp(volumeR, -0x8000, 0x7FFF);
+            }
+
+        }
     }
 }
-

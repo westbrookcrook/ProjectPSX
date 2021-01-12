@@ -1,16 +1,26 @@
-﻿using ProjectPSX.Util;
+﻿using ProjectPSX.Devices.Input;
+using ProjectPSX.Util;
 using System;
-using System.Diagnostics;
+using System.Collections.Generic;
 using System.Drawing;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Windows.Forms;
+using NAudio.Wave;
+using System.Timers;
+using System.Threading.Tasks;
+using System.Diagnostics;
+using System.Threading;
 
 namespace ProjectPSX {
-    public class Window : Form {
+    public class Window : Form, IHostWindow {
+
+        const int PSX_MHZ = 33868800;
+        const int SYNC_CYCLES = 100;
+        const int MIPS_UNDERCLOCK = 2;
 
         private Size vramSize = new Size(1024, 512);
         private Size _640x480 = new Size(640, 480);
-        //private readonly DirectBitmap buffer = new DirectBitmap();
         private readonly DoubleBufferedPanel screen = new DoubleBufferedPanel();
 
         private Display display = new Display(640, 480);
@@ -33,6 +43,13 @@ namespace ProjectPSX {
         private int displayY1;
         private int displayY2;
 
+        private long cpuCyclesCounter;
+
+        Dictionary<Keys, GamepadInputsEnum> _gamepadKeyMap;
+
+        private WaveOut waveout = new WaveOut();
+        private BufferedWaveProvider buffer = new BufferedWaveProvider(new WaveFormat());
+
         public Window() {
             Text = "ProjectPSX";
             AutoSize = true;
@@ -43,22 +60,93 @@ namespace ProjectPSX {
             screen.BackgroundImage = display.Bitmap;// TESTING
             screen.Size = _640x480;
             screen.Margin = new Padding(0);
+            screen.MouseDoubleClick += new MouseEventHandler(toggleDebug);
 
             Controls.Add(screen);
 
-            psx = new ProjectPSX(this);
-            psx.POWER_ON();
+            KeyDown += new KeyEventHandler(handleJoyPadDown);
+            KeyUp += new KeyEventHandler(handleJoyPadUp);
+
+            _gamepadKeyMap = new Dictionary<Keys, GamepadInputsEnum>() {
+                { Keys.Space, GamepadInputsEnum.Space},
+                { Keys.Z , GamepadInputsEnum.Z },
+                { Keys.C , GamepadInputsEnum.C },
+                { Keys.Enter , GamepadInputsEnum.Enter },
+                { Keys.Up , GamepadInputsEnum.Up },
+                { Keys.Right , GamepadInputsEnum.Right },
+                { Keys.Down , GamepadInputsEnum.Down },
+                { Keys.Left , GamepadInputsEnum.Left },
+                { Keys.D1 , GamepadInputsEnum.D1 },
+                { Keys.D3 , GamepadInputsEnum.D3 },
+                { Keys.Q , GamepadInputsEnum.Q },
+                { Keys.E , GamepadInputsEnum.E },
+                { Keys.W , GamepadInputsEnum.W },
+                { Keys.D , GamepadInputsEnum.D },
+                { Keys.S , GamepadInputsEnum.S },
+                { Keys.A , GamepadInputsEnum.A },
+            };
+
+            buffer.DiscardOnBufferOverflow = true;
+            buffer.BufferDuration = new TimeSpan(0, 0, 0, 0, 300);
+
+            string diskFilename = GetDiskFilename();
+            psx = new ProjectPSX(this, diskFilename);
+
+            var timer = new System.Timers.Timer(1000);
+            timer.Elapsed += OnTimedEvent;
+            timer.Enabled = true;
+
+            RunUncapped();
+        }
+
+        private string GetDiskFilename() {
+            var cla = Environment.GetCommandLineArgs();
+            if (cla.Any(s => s.EndsWith(".bin") || s.EndsWith(".cue"))) {
+                String filename = cla.First(s => s.EndsWith(".bin") || s.EndsWith(".cue"));
+                return filename;
+            }
+            else {
+                //Show the user a dialog so they can pick the bin they want to load.
+                var fileDialog = new OpenFileDialog();
+                fileDialog.Filter = "BIN/CUE files (*.bin, *.cue)|*.bin;*.cue";
+                fileDialog.ShowDialog();
+
+                string file = fileDialog.FileName;
+                return file;
+            }
+        }
+
+        private void handleJoyPadUp(object sender, KeyEventArgs e) {
+            GamepadInputsEnum? button = GetGamepadButton(e.KeyCode);
+            if(button != null)
+                psx.JoyPadUp(button.Value);
+        }
+
+        private GamepadInputsEnum? GetGamepadButton(Keys keyCode) {
+            if (_gamepadKeyMap.TryGetValue(keyCode, out GamepadInputsEnum gamepadButtonValue))
+                return gamepadButtonValue;
+            return null;
+        }
+
+        private void handleJoyPadDown(object sender, KeyEventArgs e) {
+            GamepadInputsEnum? button = GetGamepadButton(e.KeyCode);
+            if (button != null)
+                psx.JoyPadDown(button.Value);
+        }
+
+        private void toggleDebug(object sender, MouseEventArgs e) {
+            psx.toggleDebug();
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void update(int[] vramBits) {
+        public void Render(int[] vram) {
 
             if (isVramViewer) {
-                Buffer.BlockCopy(vramBits, 0, display.Bits, 0, 0x200000);
+                Buffer.BlockCopy(vram, 0, display.Bits, 0, 0x200000);
             } else if (is24BitDepth) {
-                blit24bpp(vramBits);
+                blit24bpp(vram);
             } else {
-                blit16bpp(vramBits);
+                blit16bpp(vram);
             }
 
             fps++;
@@ -132,17 +220,13 @@ namespace ProjectPSX {
             return (ushort)(m << 15 | b << 10 | g << 5 | r);
         }
 
-        public DoubleBufferedPanel getScreen() {
-            return screen;
-        }
-
-        internal int getFPS() {
+        public int GetVPS() {
             int currentFps = fps;
             fps = 0;
             return currentFps;
         }
 
-        internal void setDisplayMode(int horizontalRes, int verticalRes, bool is24BitDepth) {
+        public void SetDisplayMode(int horizontalRes, int verticalRes, bool is24BitDepth) {
             this.is24BitDepth = is24BitDepth;
 
             if (horizontalRes != this.horizontalRes || verticalRes != this.verticalRes) {
@@ -159,7 +243,7 @@ namespace ProjectPSX {
 
         }
 
-        internal void setVRAMStart(ushort displayVRAMXStart, ushort displayVRAMYStart) {
+        public void SetVRAMStart(ushort displayVRAMXStart, ushort displayVRAMYStart) {
             //if (isVramViewer) return;
 
             this.displayVRAMXStart = displayVRAMXStart;
@@ -168,7 +252,7 @@ namespace ProjectPSX {
             //Console.WriteLine($"Vram Start {displayVRAMXStart} {displayVRAMYStart}");
         }
 
-        internal void setVerticalRange(ushort displayY1, ushort displayY2) {
+        public void SetVerticalRange(ushort displayY1, ushort displayY2) {
             //if (isVramViewer) return;
 
             this.displayY1 = displayY1;
@@ -177,7 +261,7 @@ namespace ProjectPSX {
             //Console.WriteLine($"Vertical Range {displayY1} {displayY2}");
         }
 
-        internal void setHorizontalRange(ushort displayX1, ushort displayX2) {
+        public void SetHorizontalRange(ushort displayX1, ushort displayX2) {
             //if (isVramViewer) return;
 
             this.displayX1 = displayX1;
@@ -197,6 +281,41 @@ namespace ProjectPSX {
                 }
                 isVramViewer = !isVramViewer;
                 screen.BackgroundImage = display.Bitmap;
+            }
+        }
+
+        public void Play(byte[] samples) {
+            buffer.AddSamples(samples, 0, samples.Length);
+
+            if (waveout.PlaybackState != PlaybackState.Playing) {
+                waveout.Init(buffer);
+                waveout.Play();
+            }
+        }
+
+        private void OnTimedEvent(object sender, ElapsedEventArgs e) {
+            Text = $"ProjectPSX | Cpu Speed {(int)((float)cpuCyclesCounter / (PSX_MHZ / MIPS_UNDERCLOCK) * SYNC_CYCLES)}% | Vps {GetVPS()}";
+            cpuCyclesCounter = 0;
+        }
+
+        public void RunUncapped() {
+            Task t = Task.Factory.StartNew(EXECUTE, TaskCreationOptions.LongRunning);
+        }
+
+        private void EXECUTE() {
+            Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+
+            try {
+                while (true) {
+                    psx.RunFrame();
+                    int cyclesPerFrame = PSX_MHZ / 60;
+                    int syncLoops = (cyclesPerFrame / (SYNC_CYCLES * MIPS_UNDERCLOCK)) + 1;
+                    int cycles = syncLoops * SYNC_CYCLES;
+                    cpuCyclesCounter += cycles;
+                }
+            } catch (Exception e) {
+                Console.WriteLine(e.ToString());
             }
         }
     }
